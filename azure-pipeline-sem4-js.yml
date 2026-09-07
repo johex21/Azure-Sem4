@@ -1,0 +1,162 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Conexión con Azure y Grupo de Recursos
+  azureSubscription: 'Sem4-Grp4'
+  location: 'northcentralus'
+  resourceGroupName: 'Sem4-Gpo4-JS'
+
+  # Redes y Seguridad
+  virtualNetworkName: 'VNet-Sem4-JS'
+  subnetName: 'Subnet-Sem4-JS'
+  addressPrefix: '10.0.0.0/16'
+  subnetPrefix: '10.0.1.0/24'
+  securityGroupName: 'NSG-Sem4-JS'
+  publicIpName: 'PublicIP-Sem4-JS'
+
+  # Máquina Virtual 
+  vmName: 'VM-Sem4-JS'
+  vmSize: 'Standard_B2ats_v2'
+  adminUsername: 'azureuser'
+
+  # Imagen Ubuntu
+  imagePublisher: 'Canonical'
+  imageOffer: 'ubuntu-24_04-lts'
+  imageSku: 'server'
+  imageVersion: 'latest'
+
+stages:
+- stage: DeployInfrastructure
+  displayName: 'Despliegue de Infraestructura y Servidor Web'
+  jobs:
+  - deployment: DeployVM
+    displayName: 'Creación de Recursos y VM'
+    environment: 'Sem4-Gpo4-JS-Env'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Aprovisionar Infraestructura con Azure CLI'
+            # Mapeo explícito y seguro de la variable secreta como variable de entorno
+            env:
+              SECURE_ADMIN_PASSWORD: $(VM_ADMIN_PASSWORD)
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+
+                echo "=== 1. Validando Grupo de Recursos ==="
+                az group create \
+                  --name $(resourceGroupName) \
+                  --location "$(location)"
+
+                echo "=== 2. Creando Red Virtual y Subnet ==="
+                az network vnet create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(virtualNetworkName) \
+                  --address-prefix $(addressPrefix) \
+                  --subnet-name $(subnetName) \
+                  --subnet-prefix $(subnetPrefix)
+
+                echo "=== 3. Creando Grupo de Seguridad de Red (NSG) ==="
+                az network nsg create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(securityGroupName)
+
+                az network nsg rule create \
+                  --resource-group $(resourceGroupName) \
+                  --nsg-name $(securityGroupName) \
+                  --name AllowSSH \
+                  --protocol Tcp \
+                  --direction Inbound \
+                  --priority 1000 \
+                  --source-address-prefix '*' \
+                  --source-port-range '*' \
+                  --destination-address-prefix '*' \
+                  --destination-port-range 22 \
+                  --access Allow
+
+                az network nsg rule create \
+                  --resource-group $(resourceGroupName) \
+                  --nsg-name $(securityGroupName) \
+                  --name AllowHTTP \
+                  --protocol Tcp \
+                  --direction Inbound \
+                  --priority 1001 \
+                  --source-address-prefix '*' \
+                  --source-port-range '*' \
+                  --destination-address-prefix '*' \
+                  --destination-port-range 80 \
+                  --access Allow
+
+                az network nsg rule create \
+                  --resource-group $(resourceGroupName) \
+                  --nsg-name $(securityGroupName) \
+                  --name AllowICMP \
+                  --protocol Icmp \
+                  --direction Inbound \
+                  --priority 1002 \
+                  --source-address-prefix '*' \
+                  --source-port-range '*' \
+                  --destination-address-prefix '*' \
+                  --destination-port-range '*' \
+                  --access Allow
+
+                az network vnet subnet update \
+                  --resource-group $(resourceGroupName) \
+                  --vnet-name $(virtualNetworkName) \
+                  --name $(subnetName) \
+                  --network-security-group $(securityGroupName)
+
+                echo "=== 4. Creando IP Pública Estática ==="
+                az network public-ip create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(publicIpName) \
+                  --sku Standard \
+                  --allocation-method Static
+
+                echo "=== 5. Generando script de inicio (cloud-init) ==="
+                cat << 'EOF' > cloud-init.txt
+                #cloud-config
+                package_upgrade: true
+                packages:
+                  - apache2
+                runcmd:
+                  - systemctl enable apache2
+                  - systemctl start apache2
+                  - echo "<h1>Hola curso DevOps: Despliegue 100% automatizado en Azure</h1>" > /var/www/html/index.html
+                EOF
+
+                echo "=== 6. Creando Máquina Virtual ==="
+                # Usamos la variable de entorno $SECURE_ADMIN_PASSWORD
+                az vm create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(vmName) \
+                  --image "$(imagePublisher):$(imageOffer):$(imageSku):$(imageVersion)" \
+                  --size $(vmSize) \
+                  --admin-username $(adminUsername) \
+                  --admin-password "$SECURE_ADMIN_PASSWORD" \
+                  --vnet-name $(virtualNetworkName) \
+                  --subnet $(subnetName) \
+                  --nsg $(securityGroupName) \
+                  --public-ip-address $(publicIpName) \
+                  --custom-data cloud-init.txt
+
+                echo "=== 7. Consultando IP Pública asignada ==="
+                IP_PUBLICA=$(az network public-ip show \
+                  --resource-group $(resourceGroupName) \
+                  --name $(publicIpName) \
+                  --query ipAddress \
+                  --output tsv)
+
+                echo "========================================================="
+                echo "¡Despliegue finalizado con éxito!"
+                echo "Accede a la web en: http://${IP_PUBLICA}"
+                echo "========================================================="
