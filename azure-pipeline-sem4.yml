@@ -1,0 +1,164 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Conexión y Región
+  azureSubscription: 'Sem4-Grp4'             # Service Connection en Azure DevOps
+  location: 'northcentralus'              # Región de Azure
+  resourceGroupName: 'Sem4-Gpo4-JS'
+
+  # Redes y Seguridad
+  virtualNetworkName: 'VNet-taller-DevOps'
+  subnetName: 'Subnet-taller-DevOps'
+  addressPrefix: '10.0.0.0/16'
+  subnetPrefix: '10.0.1.0/24'
+  securityGroupName: 'NSG-taller-DevOps'
+  publicIpName: 'PublicIP-2-taller-DevOps'
+
+  # Máquina Virtual
+  vmName: 'VM-2-taller-DevOps'
+  vmSize: 'Standard_B2ats_v2'             # SKU compatible con tu región
+  adminUsername: 'azureuser'
+  adminPassword: 'Az*123456789'          # Idealmente definirla como variable secreta en Azure DevOps
+
+  # Imagen Ubuntu
+  imagePublisher: 'Canonical'
+  imageOffer: 'ubuntu-24_04-lts'
+  imageSku: 'server'
+  imageVersion: 'latest'
+
+stages:
+- stage: DeployInfrastructure
+  displayName: 'Despliegue de Infraestructura y Servidor Web'
+  jobs:
+  - deployment: DeployVM
+    displayName: 'Creación de VM y Recursos'
+    # Define el entorno lógico en Azure DevOps (Pipelines > Environments)
+    environment: 'Taller-DevOps-Env'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Provisionar Recursos con Azure CLI'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+
+                echo "=== 1. Creando Grupo de Recursos ==="
+                az group create \
+                  --name $(resourceGroupName) \
+                  --location "$(location)"
+
+                echo "=== 2. Creando Red Virtual y Subnet ==="
+                az network vnet create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(virtualNetworkName) \
+                  --address-prefix $(addressPrefix) \
+                  --subnet-name $(subnetName) \
+                  --subnet-prefix $(subnetPrefix)
+
+                echo "=== 3. Creando Network Security Group (NSG) y Reglas ==="
+                az network nsg create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(securityGroupName)
+
+                # Regla SSH (Puerto 22)
+                az network nsg rule create \
+                  --resource-group $(resourceGroupName) \
+                  --nsg-name $(securityGroupName) \
+                  --name AllowSSH \
+                  --protocol Tcp \
+                  --direction Inbound \
+                  --priority 1000 \
+                  --source-address-prefix '*' \
+                  --source-port-range '*' \
+                  --destination-address-prefix '*' \
+                  --destination-port-range 22 \
+                  --access Allow
+
+                # Regla HTTP (Puerto 80)
+                az network nsg rule create \
+                  --resource-group $(resourceGroupName) \
+                  --nsg-name $(securityGroupName) \
+                  --name AllowHTTP \
+                  --protocol Tcp \
+                  --direction Inbound \
+                  --priority 1001 \
+                  --source-address-prefix '*' \
+                  --source-port-range '*' \
+                  --destination-address-prefix '*' \
+                  --destination-port-range 80 \
+                  --access Allow
+
+                # Regla ICMP (Ping)
+                az network nsg rule create \
+                  --resource-group $(resourceGroupName) \
+                  --nsg-name $(securityGroupName) \
+                  --name AllowICMP \
+                  --protocol Icmp \
+                  --direction Inbound \
+                  --priority 1002 \
+                  --source-address-prefix '*' \
+                  --source-port-range '*' \
+                  --destination-address-prefix '*' \
+                  --destination-port-range '*' \
+                  --access Allow
+
+                # Asociar NSG directamente a la Subnet (mejores prácticas de seguridad)
+                az network vnet subnet update \
+                  --resource-group $(resourceGroupName) \
+                  --vnet-name $(virtualNetworkName) \
+                  --name $(subnetName) \
+                  --network-security-group $(securityGroupName)
+
+                echo "=== 4. Creando IP Pública ==="
+                az network public-ip create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(publicIpName) \
+                  --sku Standard \
+                  --allocation-method Static
+
+                echo "=== 5. Preparando script de configuración inicial (cloud-init) ==="
+                cat << 'EOF' > cloud-init.txt
+                #cloud-config
+                package_upgrade: true
+                packages:
+                  - apache2
+                runcmd:
+                  - systemctl enable apache2
+                  - systemctl start apache2
+                  - echo "<h1>Hola curso DevOps: Despliegue 100% automatizado en Azure</h1>" > /var/www/html/index.html
+                EOF
+
+                echo "=== 6. Creando Máquina Virtual con auto-instalación ==="
+                az vm create \
+                  --resource-group $(resourceGroupName) \
+                  --name $(vmName) \
+                  --image "$(imagePublisher):$(imageOffer):$(imageSku):$(imageVersion)" \
+                  --size $(vmSize) \
+                  --admin-username $(adminUsername) \
+                  --admin-password '$(adminPassword)' \
+                  --vnet-name $(virtualNetworkName) \
+                  --subnet $(subnetName) \
+                  --nsg $(securityGroupName) \
+                  --public-ip-address $(publicIpName) \
+                  --custom-data cloud-init.txt
+
+                echo "=== 7. Consultando IP Pública asignada ==="
+                IP_PUBLICA=$(az network public-ip show \
+                  --resource-group $(resourceGroupName) \
+                  --name $(publicIpName) \
+                  --query ipAddress \
+                  --output tsv)
+
+                echo "---------------------------------------------------------"
+                echo "¡Despliegue finalizado con éxito!"
+                echo "Puedes acceder a tu servidor Apache en: http://${IP_PUBLICA}"
+                echo "---------------------------------------------------------"
